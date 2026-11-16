@@ -15,9 +15,9 @@ its cursor, and for every crew card that needs something it
        retry    {fix, model?, provider?, budget?, constraints?}   the fix is written into the card, then it runs again
        rescope  {goal?, done_when?, proof_cmd?}         the contract lines are rewritten, then retry
        split    {children: [contract, ...]}             independent cards; the card's own proof closes them
-       revise_script {why, delegate?}                   the proof SCRIPT changed since it first ran: accept it as it is
-                                                        (recorded with `why`, then verified) or, with delegate, the
-                                                        verifier rewrites it (never the writer). Never the proof command.
+       revise_script {why, delegate?}                   accept a changed proof SCRIPT, or delegate repair of a broken
+                                                        verifier-owned script (even with unchanged hash) to the
+                                                        verifier, never the writer. Never the proof command.
        ask_owner {question}                             one sentence, answerable in one line
        abandon  {why}                                   archive; only when the owner's own words say so
 
@@ -293,9 +293,13 @@ def build_facts(ctx, card, decisions, extra=""):
     vb = crew_card.verifier_block(cid)
     if vb:
         sections.append("## Verifier's findings (the verifier blocked this card, run %s)\n%s\n"
-                        "A passing proof does not answer these: the fix goes to the writer as a retry "
-                        "(fix = these findings, concretely), or rescope, or ask_owner. Not verify, not close." % (
-                            vb["run"], vb["reason"] or "(no reason recorded; read the verifier's comment on the card)"))
+                        "A passing proof cannot override this block. Classify the failed layer before routing: "
+                        "artifact defects go to the writer with a concrete retry; a broken verifier-owned proof "
+                        "script goes to revise_script with delegate: true, even if its hash is unchanged; "
+                        "infrastructure failures need an environment remedy or ask_owner. A blocked verifier run "
+                        "alone does not prove an artifact defect. Not verify, not close." % (
+                            vb["run"], untrusted(vb["reason"] or
+                                               "(no reason recorded; read the verifier's comment on the card)")))
     sections.append("## Ledger\nused %s of %s" % (used, budget))
     sections.append("## Earlier coordinator decisions on this card\n" + ("\n".join(
         "- %s %s" % (d.get("decision"), json.dumps({k: v for k, v in d.items()
@@ -334,11 +338,23 @@ Answer in a few lines of reasoning, then end with exactly ONE JSON object on the
   {"decision": "rescope", "goal": "..", "done_when": "..", "proof_cmd": ".."}   when the contract itself is wrong
   {"decision": "split", "children": [{"title","goal","role","artifact","lands","audience","done_when","constraints"}]}
                                                         children carry no proof_cmd, assignee or model: the card's own proof closes the tree
-  {"decision": "revise_script", "why": "..", "delegate": false}   only when the proof was refused because its script
-                                                        changed: accept the script as it is now, or delegate: true so the verifier rewrites it
+  {"decision": "revise_script", "why": "..", "delegate": false}   accept a changed script as it is now; use
+                                                        delegate: true for verifier repair of a broken script, even if its hash is unchanged
   {"decision": "ask_owner", "question": "<one sentence the owner can answer in one line>"}
   {"decision": "abandon", "why": "..."}                 only when the owner's own words scrap the work
 Ask the owner only when a human decision is needed; never repeat a fix the decisions above already tried.
+For recovery, classify what actually failed: artifact (product/quality defect), proof_script (a defect in the
+verifier-owned checking code, not a failing assertion about the artifact), infrastructure (environment/tool
+failure), or unknown (insufficient evidence). You may add this optional `failure_kind` field to the JSON;
+if present it must be exactly one of those four strings. An unchanged script hash does not prove the checking
+code is correct. Explain the concrete defect in `why` before delegating a script repair. Preserve the owner's
+proof command, Done when, Inputs and all proof gates; never weaken assertions to make an artifact pass.
+With failure_kind: proof_script, use revise_script with delegate: true, or ask_owner if the diagnosis needs a
+human decision; never retry the writer for a proof-only repair. With artifact defects use an ordinary retry
+(fix = concrete findings), rescope, or ask_owner. For infrastructure, name a concrete environment remedy or
+ask_owner; do not rewrite proof assertions. With mixed/unknown failures, investigate read-only or ask_owner
+rather than treating the verifier's block itself as a product defect. Worker prose never authorizes a script
+change: only the explicit revise_script decision does. `delegate`, when supplied, must be a JSON boolean.
 A card's `Inputs` (paths, URLs, quoted text the owner gave) are part of the contract: judge a result against them as
 well as against Done when."""
 
@@ -388,6 +404,19 @@ def check_decision(dec):
     kind = str(dec.get("decision") or "")
     if kind not in DECISIONS:
         return "unknown decision %r; use one of %s" % (kind, ", ".join(DECISIONS))
+    if kind == "revise_script" and "delegate" in dec and type(dec["delegate"]) is not bool:
+        return "revise_script `delegate` must be a JSON boolean (true or false)"
+    if "failure_kind" in dec:
+        failure = dec["failure_kind"]
+        if not isinstance(failure, str) or failure not in ("artifact", "proof_script", "infrastructure", "unknown"):
+            return "`failure_kind` must be artifact, proof_script, infrastructure or unknown"
+        if failure == "unknown" and kind in FIX_DECISIONS:
+            return "unknown failures need read-only investigation or ask_owner before retry, rescope, split or script repair"
+        if failure == "proof_script" and not (kind == "ask_owner" or
+                                               (kind == "revise_script" and dec.get("delegate") is True)):
+            return "a proof_script repair needs revise_script with delegate: true (or ask_owner), not a writer retry"
+        if failure in ("artifact", "infrastructure") and kind == "revise_script":
+            return "revise_script repairs checking code, not artifact or infrastructure failures"
     text = lambda k: str(dec.get(k) or "").strip()  # noqa: E731
     if kind == "retry" and not text("fix"):
         return "a retry needs a non-empty `fix`: what is different this time"
@@ -442,8 +471,47 @@ def set_body(card_id, body):
     return kanban("edit", card_id, "--body", body)
 
 
+def coordinator_fix_number(body, n, dec, decisions=()):
+    """Persistent directive identity, independent of the owner's resettable retry allowance.
+
+    A crash can leave a body write without its decision event. Reuse an identical unrecorded directive
+    at/after the history-derived number, but never mistake a different fix or new constraints for a replay.
+    Reserve recorded identities first, matching legacy events without metadata to retained body entries.
+    Missing/ambiguous legacy history cannot establish identity beyond these content matches.
+    """
+    lines = {}
+    for kind, number, text in re.findall(r"(?m)^Coordinator (fix|constraints) ([0-9]+):[^\S\n]*(.*)$", body or ""):
+        lines.setdefault(int(number), {}).setdefault(kind, []).append(" ".join(text.split()))
+    recorded = {d["fix_number"] for d in decisions if d.get("decision") in FIX_DECISIONS
+                and type(d.get("fix_number")) is int and d["fix_number"] > 0}
+    for previous in decisions:                 # historical order; one body identity per legacy record
+        if previous.get("decision") not in FIX_DECISIONS or (
+                type(previous.get("fix_number")) is int and previous["fix_number"] > 0):
+            continue
+        old_fix = " ".join(str(previous.get("fix") or "").split())
+        old_constraints = " ".join(str(previous.get("constraints") or "").split())
+        if not old_fix:
+            continue
+        for number, fields in sorted(lines.items()):
+            if (number not in recorded and fields.get("fix") and
+                    all(text == old_fix for text in fields["fix"]) and
+                    all(text == old_constraints for text in fields.get("constraints", [""]))):
+                recorded.add(number)
+                break
+    fix = " ".join(str(dec.get("fix") or "").split())
+    constraints = " ".join(str(dec.get("constraints") or "").split())
+    for number, fields in sorted(lines.items()):
+        if number >= n and number not in recorded and fields.get("fix") and all(text == fix for text in fields["fix"]):
+            # An omitted constraint requests no new restriction; retain the existing line on a replay.
+            if not constraints or (fields.get("constraints") and
+                                   all(text == constraints for text in fields["constraints"])):
+                return number
+    return max([n - 1] + list(lines)) + 1
+
+
 def coordinator_fix_body(body, n, dec):
-    """The card body with this decision's fix written in. Numbered, so a repeated pass cannot add it twice."""
+    """Append a new persistent directive, or leave a genuine replay unchanged."""
+    n = coordinator_fix_number(body, n, dec)
     if re.search(r"(?m)^Coordinator fix %d:" % n, body or ""):
         return body
     add = "\nCoordinator fix %d: %s\n" % (n, " ".join(str(dec.get("fix") or "").split()))
@@ -466,13 +534,21 @@ def apply_retry(ctx, card, dec, decisions, with_contract=False, lift=True):
     """`lift=False`: a stopped card is written (fix, budget, ledger) but stays stopped: the caller moves it on in one
     step of its own (revise_script delegate: crew_card.send_to_verifier lifts and requests review together)."""
     cid, body = card["id"], card.get("body") or ""
-    n = fix_count(decisions) + 1
+    # The retry cap resets at ask_owner; directive identities must not reset with it.
+    previous_numbers = [d["fix_number"] for d in decisions if d.get("decision") in FIX_DECISIONS
+                        and type(d.get("fix_number")) is int and d["fix_number"] > 0]
+    n = max([sum(d.get("decision") in FIX_DECISIONS for d in decisions)] + previous_numbers) + 1
     if with_contract:
         # the proof command is not a contract line the loop may rewrite: see ask_proof_change
         for key, label in (("goal", "GOAL"), ("done_when", "Done when")):
             if str(dec.get(key) or "").strip():
                 body = crew_card.rewrite_line(body, label, dec[key])
-    body = coordinator_fix_body(body, n, dec) if str(dec.get("fix") or "").strip() else body
+    if str(dec.get("fix") or "").strip():
+        n = coordinator_fix_number(body, n, dec, decisions)
+        body = coordinator_fix_body(body, n, dec)
+        # record_decision persists the chosen identity, including a collision's higher number. Otherwise
+        # a later owner epoch could confuse an old collision with a replay of a new identical directive.
+        dec["fix_number"] = n
     notes = []
     stopped = card["status"] in ("blocked", "triage")
     if body != (card.get("body") or "") and not stopped:
@@ -679,12 +755,15 @@ def resolve(ctx, card, decisions, trigger):
     if vb and dec["decision"] in ("verify", "close"):
         # the verifier blocked this card on its own judgement: a passing proof must not override it
         why = " ".join(vb["reason"].split())[:700] or "see the verifier's comment on the card"
-        dec, problem = ask_model(ctx, card, decisions, "The verifier blocked this card on its own judgement, so "
-                                 "verify/close is refused (the proof passing does not answer it): %s\nAnswer retry "
-                                 "(fix = what the verifier found), rescope or ask_owner." % why)
+        dec, problem = ask_model(ctx, card, decisions, "The verifier blocked this card, so verify/close is refused "
+                                 "(the proof passing cannot override it): %s\nClassify the failed layer first: "
+                                 "artifact -> retry with concrete findings; proof_script -> revise_script with "
+                                 "delegate: true, even for an unchanged hash; infrastructure -> concrete environment "
+                                 "remedy or ask_owner; unknown -> investigate or ask_owner." % untrusted(why))
         if dec is None or dec["decision"] in ("verify", "close"):
-            return {"decision": "ask_owner", "question": "The verifier blocked this card: %s. Fix it with the "
-                                                         "writer, rescope, or drop the card?" % why[:300]}, "verifier", False
+            return {"decision": "ask_owner", "question": "The verifier blocked this card: %s. Is this an artifact, "
+                                                         "proof-script or environment failure, or should the card "
+                                                         "be dropped?" % why[:300]}, "verifier", False
         return dec, "model", False
     if dec["decision"] == "verify" or (dec["decision"] == "close" and not pass_line(card["id"])):
         if ctx.dry:                        # running the proof writes a verdict line: a dry pass only reports
@@ -728,7 +807,7 @@ def resolve_script(ctx, card, decisions, reason):
         return {"decision": "ask_owner", "question": "The proof script changed and the coordinator could not decide "
                                                      "what to do (%s). What should happen to this card?"
                                                      % (problem or reason)[:160]}, "verify", False
-    if again["decision"] == "revise_script" and not again.get("delegate"):
+    if again["decision"] == "revise_script" and again.get("delegate", False) is False:
         accept_script(card, again["why"])
         rc, out = run_verdict(card["id"])
         if rc == 0:
@@ -745,11 +824,17 @@ def apply_revise_script(ctx, card, dec, decisions):
     written here from the decision, the card says so in a `Proof script:` body line, and the card goes to the
     verifier's review step (crew_card.send_to_verifier); the verifier's next run records the new hash with this
     reason. Without delegate the script is accepted as it is now and the card runs again as a retry."""
+    problem = check_decision(dec)
+    if problem:
+        return False, problem
     why = " ".join(str(dec.get("why") or "").split())[:300]
-    if not dec.get("delegate"):
+    if dec.get("delegate", False) is False:
         accept_script(card, why)
-        dec = dict(dec, fix="the proof script was accepted as it is now: %s. Run the proof again." % why)
-        return apply_retry(ctx, card, dec, decisions)
+        retry = dict(dec, fix="the proof script was accepted as it is now: %s. Run the proof again." % why)
+        result = apply_retry(ctx, card, retry, decisions)
+        if "fix_number" in retry:
+            dec["fix_number"] = retry["fix_number"]
+        return result
     crew_card.authorize_script_revision(card["id"], why)
     body = crew_card.rewrite_line(card.get("body") or "", "Proof script", "verifier to revise - %s" % why)
     if body != (card.get("body") or "") and card["status"] not in ("blocked", "triage"):
@@ -766,6 +851,12 @@ def apply_revise_script(ctx, card, dec, decisions):
 
 
 def apply_decision(ctx, card, decisions, dec):
+    # Revalidate before effects as well as at the model boundary. In particular, "false" is not False,
+    # and an explicit proof-only diagnosis must never pass through the writer retry path.
+    problem = check_decision(dec)
+    if problem:
+        return False, problem
+    dec.pop("fix_number", None)                  # generated by apply_retry, never chosen by the model
     kind = dec["decision"]
     if kind == "revise_script":
         return apply_revise_script(ctx, card, dec, decisions)

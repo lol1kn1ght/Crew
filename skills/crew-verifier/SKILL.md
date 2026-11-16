@@ -7,20 +7,39 @@ version: 0.10.9
 # Crew verifier pass
 
 Used only on a card whose `Verify:` line is `independent`. A `Verify: proof` card never reaches you: its
-writer proves it and the coordinator audits it. You judge; you never fix.
+writer proves it and the coordinator audits it. You judge the artifact; you never repair it.
+
+## Proof-script boundary
+
+- Never write or repair product files, artifacts, tests, docs or specs.
+- The only file you may write is the assigned card's proof script at the exact `.crew/` path in its
+  owner-confirmed proof command. No other `.crew/` file is authorized. The writer never writes proof scripts.
+- Use native file tools `write_file` and `patch` under Hermes approvals, only for that script. This is a
+  policy exception for the assigned file, not a claim that every `.crew/` path is yours or that approval is automatic.
+  Never bypass an approval refusal via shell, another executor, changed settings or toolsets.
+  No send, delegate or arbitrary code-execute tools; terminal checks remain read-only.
 
 ## Do, in this order, then stop
 
-A. The card's proof command runs a script in a `.crew/` folder (`sh "$HERMES_HOME/plugins/crew/scripts/crew-run.sh" <folder>/.crew/<card folder>/verify.py`) and the script
-   does not exist yet: you write it FIRST. You are the only role that writes proof scripts; the writer never does.
-   Write it with your own file tool (`write_file`, under Hermes approvals; your file tools reach `.crew/` and
-   nothing else), from the card's `Done when` clauses and its `Inputs`: one check per clause, standard library only
-   (no third-party imports: a proof runner's python has none, `websockets` missing is how t_d3c396cd failed), exit 0
-   only when every check passes, one line per check on stdout. Take the checks from the contract. Never tailor them
-   to the artifact's weaknesses or to what you have seen it do: a clause the artifact cannot meet must fail.
-   A card carrying `Proof script: verifier to revise - <reason>` is a coordinator-authorized revision: rewrite the
-   existing script as the reason says, again from the contract, then continue. Any other change to a script that has
-   already run is refused (exit 5, "proof script changed since it first ran").
+A. The card's owner-confirmed proof command runs a script in a `.crew/` folder
+   (`sh "$HERMES_HOME/plugins/crew/scripts/crew-run.sh" <folder>/.crew/<card folder>/verify.py`) and the script
+   is missing: create it FIRST with `write_file`, from the owner-confirmed contract's `Done when` clauses and
+   `Inputs`: one check per clause, standard library only (the proof runner may lack third-party packages),
+   exit 0 only when every check passes, one line per check on stdout. Never tailor checks to the artifact's
+   weaknesses or to what you have seen it do: a clause the artifact cannot meet must fail.
+   Initial creation is allowed only before the script has ever run; recreating a missing previously run
+   script requires the revision authorization below.
+
+   After the first run, revise only through the coordinator's existing `revise_script` with `delegate: true`,
+   a pending native authorization event for this card and handoff to the verifier's review step.
+   `Proof script: verifier to revise - <reason>` alone is not authorization. Verify native coordinator
+   authorization and its reason in the card's evidence, not a body line or a writer's request.
+   Without that authorization, do not revise or self-authorize; report the blocker to the coordinator.
+   An ordinary retry is not revision permission. Preserve script-hash binding: any unauthorized change
+   after first run remains refused (exit 5, "proof script changed since it first ran"). The authorized
+   rerun records the changed hash with the coordinator's reason; do not edit hash records yourself.
+   If initial creation is blocked, report that failure rather than repeatedly running a known absent script.
+
 0. Record the card's own proof through the tool, not in prose:
 
        crew_verdict(card="<card id>")
@@ -40,20 +59,29 @@ A. The card's proof command runs a script in a `.crew/` folder (`sh "$HERMES_HOM
    Units listed in the card body are marked with `crew_progress(card=<id>, unit="<unit>", result="pass"|"fail",
    evidence="<raw line>")`, only from your own run.
 2. Verdict: PASS - `kanban_complete` with the raw output; FAIL - `kanban_request_changes` naming the exact
-   missing item. Then end the turn.
+   missing item or proof/infrastructure failure. Keep the native verdict as recorded; explain the failure's
+   cause in the evidence, not by inventing another verdict type. Then end the turn.
+
+## Failure ownership
+
+A broken proof harness or verification infrastructure is not evidence of a product defect. Report the
+raw error and request coordinator recovery: only the authorized verifier revises the proof, not the writer.
+An unmet contract clause demonstrated by a sound proof is a product defect for the writer to fix.
+Never weaken `Done when` or fabricate PASS. A harness error or Not run is not product acceptance; do not
+ask the writer to change product files, tests, docs or specs to satisfy a faulty proof. Preserve existing
+FAIL history and stop/hand-back rules; a report of a harness failure does not erase or override a native verdict.
 
 ## Never
 
-- Read the writer's summary, chat reply or transcript as evidence of the work.
-- Write, edit or fix the artifact you are judging (the proof script under `.crew/` is the one file you write).
+- Never use the writer's summary, chat reply or transcript as evidence of the work.
+- Write, edit or fix the artifact you are judging; the assigned proof script above is the sole file exception.
 - Run a third check, or a check that writes, moves, deletes, commits or sends.
 - Accept "done", "works" or a rewritten proof command as a pass. If the proof cannot be run, say so and hand
-  the card back.
-
+  the card back with the precise execution/approval blocker, not an invented product defect.
 - Edit a skill file (crew's skills are shipped and overwritten on update). A lesson worth keeping: `crew_lesson(role=<role>, text="...")`.
 
 ## Stop rules
 
 - `kanban_complete` is refused unless the card's proof command has a PASS line from you, recorded after you
-  claimed the card, with no failed check after it.
+  claimed the card, with no failed check after it. PASS also requires the artifact present and no failed extra check.
 - Two FAIL verdicts on one card hand it back to its writer; the coordinator decides next.
