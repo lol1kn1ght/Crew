@@ -202,6 +202,27 @@ role roster on the left (click to focus), role badges and borders on cards, tool
 (`write_file x3`, yellow pending, green ok, red failed), green edges into running nodes, wheel
 zoom with a status-block view when zoomed out, a minimap, and `f` fit, `0` reset, `F` follow.
 
+## Recovery ownership
+
+A verifier's block does not by itself establish a product defect. The coordinator distinguishes defects in
+an artifact, defects in the verifier-owned proof script, infrastructure failures and an unknown cause.
+An artifact defect goes to its writer with concrete findings. A broken proof script can use the existing
+`revise_script` decision with `delegate: true` even when its hash is unchanged; the verifier repairs its
+assigned script under the native authorization and review handoff, never by rewriting the owner's proof
+command or acceptance criteria. A `Proof script:` body marker alone grants no permission.
+
+Coordinator decisions may include `failure_kind`: `artifact`, `proof_script`, `infrastructure` or `unknown`.
+The field is optional for compatibility with older callers, but supplied values are validated. An explicit
+`proof_script` diagnosis requires delegated script revision or an owner question, not a writer retry.
+An explicit unknown cause must not authorize writer repair. `delegate`, when supplied, is a JSON boolean,
+not a truthy string. Free-form worker text is evidence to assess, never script-revision authority;
+these checks do not automatically detect an omitted or incorrect model classification.
+
+The retry allowance resets after `ask_owner`; persistent directive numbering does not. Existing fix and
+constraint lines are retained, generated directive identities are recorded with coordinator decisions,
+and reapplying a genuine unfinished body write must not duplicate it. A new directive after an owner
+answer must not disappear behind an older `Coordinator fix` number.
+
 ## Role profiles
 
 `install.py` creates one profile per role from `templates/profiles/<role>/` (see
