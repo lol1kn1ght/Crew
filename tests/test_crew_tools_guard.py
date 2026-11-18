@@ -94,7 +94,7 @@ class GuardTests(unittest.TestCase):
 
     def test_crew_plan_with_a_kanban_task_is_allowed(self):
         os.environ["HERMES_KANBAN_TASK"] = "t_x"
-        with mock.patch.object(P, "_card_budget", lambda c: 0):
+        with mock.patch.object(P, "_card_budget", lambda c: 200000):
             self.assertIsNone(self.guard("crew_plan", {"spec": {}}, role="worker"))
 
     def test_a_terminal_card_open_is_still_refused_outside_a_crew_turn(self):
@@ -107,12 +107,12 @@ class GuardTests(unittest.TestCase):
         # The same rule as crew_plan and kanban_create: a role process may open a card.
         os.environ["HERMES_KANBAN_TASK"] = "t_x"
         cmd = 'sh "$HERMES_HOME/plugins/crew/scripts/crew-run.sh" crew_card.py open --title X'
-        with mock.patch.object(P, "_card_budget", lambda c: 0):
+        with mock.patch.object(P, "_card_budget", lambda c: 200000):
             self.assertIsNone(self.guard("terminal", {"command": cmd}, role="worker"))
 
     def test_verifier_cannot_plan_but_can_verdict(self):
         os.environ["HERMES_KANBAN_TASK"] = "t_x"
-        with mock.patch.object(P, "_card_budget", lambda c: 0), mock.patch.object(P, "_verdict_fails", lambda c: 0):
+        with mock.patch.object(P, "_card_budget", lambda c: 200000), mock.patch.object(P, "_verdict_fails", lambda c: 0):
             res = self.guard("crew_plan", {"spec": {}}, role="verifier")
             self.assertEqual("block", res["action"])
             self.assertIn("verifier has no write/send tools", res["message"])

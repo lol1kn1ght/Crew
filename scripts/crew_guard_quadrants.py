@@ -68,6 +68,10 @@ def main():
     os.environ.pop("HERMES_KANBAN_TASK", None)
     os.environ.pop("HERMES_KANBAN_RUN_ID", None)
     tool = load("crew_card_quadrants", os.path.join(HERE, "crew_card.py"))
+    # Match a normally opened synthetic card: the body alone is not proof consent.
+    assert not tool.close_check(CARD, BODY, tool.claimed_at(CARD))[0]
+    assert tool.record_origin(CARD, env={"origin": "", "session": "synthetic-quadrants"}, proof_cmd=PROOF)
+    assert tool.close_proof_command(CARD) == PROOF
     mod = load("crew_plugin_under_test", PLUGIN)
     rows, bad = [], []
 
@@ -100,8 +104,7 @@ def main():
             os.environ["HERMES_KANBAN_TASK"] = CARD
             mod._ROLE = profile
 
-    mod._BUDGET_CACHE.clear()
-    mod._card_budget = lambda card: 0           # the close rule is proved with no ceiling in play
+    mod._card_budget = lambda card: 1000        # valid under-budget fixture isolates the close rule
     mod._budget_used = lambda card: 0
     mod._note_overrun = lambda *a, **k: None
 
@@ -146,7 +149,7 @@ def main():
                   action(mod.crew_tool_guard(tool_name=tool_name, args=args)), want)
 
     # 2. the rework cap: two FAIL lines stop the writer re-submitting or closing
-    mod._card_budget = lambda card: 0
+    mod._card_budget = lambda card: 1000        # valid under-budget fixture isolates the rework cap
     mod._budget_used = lambda card: 0
     for tool_name in ("kanban_request_review", "kanban_complete"):
         reset()

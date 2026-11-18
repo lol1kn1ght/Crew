@@ -1,49 +1,30 @@
 #!/usr/bin/env python3
-"""Stop crew work without destroying it: kill the worker, park the card, keep everything.
+"""Stop one card (or all open Crew cards), retaining work and reporting worker settlement honestly.
 
-  crew_stop.py <card id>             PARK that one card: worker killed, session closed, card held for the owner
-  crew_stop.py <card id> --archive   the real drop: as above, then the card is archived (explicit, one card)
-  crew_stop.py                       PARK every CREW card that is not done or archived (a card without a crew
-                                     Coordinator:/Role: line is somebody else's and is never touched). Never archives.
-  [--dry-run] [--json] [--quiet]
+  crew_stop.py [<card id>] [--archive] [--dry-run] [--json] [--quiet]
 
-WHAT ONE STOP DOES, IN ORDER
+ORDER: capture relevant native run identities; PARK and verify the owner hold; only then terminate
+exact supported owned workers through the existing cmdline/card guard + native start fingerprint and
+crew_proc. On POSIX the worker must own an isolated process group, never the caller's group. Re-read
+captured identities even after native park terminalizes their run rows; include a run claimed before
+the winning park. Do not signal arbitrary historical terminal PIDs. Unknown/reused/unreadable identity
+is refusal, not permission to use another killer. Dead/zombie workers need no signal.
 
-  1. kill the process group of every live run of the card (its own worker_pid). A pid that answers
-     but is not this card's own worker is never touched - the guard reads the process's command
-     line, so the gateway, the board server and the caller are safe by construction.
-  2. close the session row each killed worker left open, through Hermes' own SessionDB.end_session
-     (a killed worker never writes its session's ended_at, and every surface that reads a session then
-     draws it as running for ever). No raw write into a profile's state.db: when hermes_state cannot
-     be imported the sessions are reported as not closed.
-  3. PARK the card with the kernel's own verbs, reason "stopped by owner (/crew-stop) - continue with
-     /crew-unstuck <id>" (crew_card.owner_stop_reason): running/ready -> `hermes kanban block --kind <k>`
-     (the Needs-you lane); todo/blocked -> `hermes kanban schedule`. With --archive: `hermes kanban archive`.
-  4. re-read the card and say so when it did not hold.
+Running/ready use a different typed block kind to avoid recurrence-to-triage; runless review/triage
+use native operator needs_input park; todo/blocked use phase-preserving schedule. A foreign scheduled
+state without the owner marker is NOT a successful owner park. Repeat own park is idempotent.
 
-WHY THIS PARK HOLDS (read from hermes_cli/kanban_db.py, 2026-10-03)
+parked=true can coexist with worker_settled=false: the board fence is not OS settlement. Overall stop
+is NOT DOWN until relevant workers settle. Sessions are conservatively left open until all relevant
+workers settle. --archive is an explicit drop after park + settlement (or an already-terminal card); never recursive.
+--dry-run has no board changes, signals or session closure. Open family is reported, not followed.
 
-  - recompute_ready skips a `blocked` card whose newest block event is explicit (_has_sticky_block), and reads only
-    todo/blocked, so a `scheduled` card is never promoted; every dispatch query needs ready.
-  - block_task only moves running/ready. A parent-gated `todo` or an already-`blocked` card cannot be blocked, which
-    is what `schedule_task` (todo/ready/running/blocked -> scheduled, not dispatchable, `unblock` re-gates) is for.
-  - the kind: a same-kind re-block routes to `triage` (BLOCK_RECURRENCE_LIMIT) and triage feeds the decomposer,
-    so the kind is the first of needs_input/capability/transient that differs from the card's last block kind.
-  - the coordinator (handle_card), crew_heal.heal_card and crew_notify (card_reports) recognise the reason
-    (crew_card.parked_by_owner) and leave the card alone: no decision, no heal, no "needs you" ping.
-  - triage and review cards have no park verb in the kernel: they are reported as NOT down, never as stopped.
+Continue through /crew-unstuck <id> (pending proof consent requires /crew-proof instead). The native
+unblock retains review phase, reviewer and parent gates. Coordinator/heal/notify leave owner parks
+alone. This is a supported-native-consumer fence and observed-identity check, not a universal lease,
+all-writer barrier or proof of quiescence against arbitrary later writes/PID races.
 
-CONTINUE: /crew-unstuck <id> (crew_card.unstuck_card -> `hermes kanban unblock`): the card goes back in the queue
-and the worker resumes with the card's whole history.
-
-THE FAMILY IS REPORTED, NEVER SILENTLY FOLLOWED
-
-  A card the decomposer fanned out keeps its work alive in child cards. This pass names the open cards linked to
-  the one it stopped; stopping them is a second, explicit ask.
-
-Run:  python3 crew_stop.py [<card id>] [--archive] [--dry-run] [--json] [--quiet]
-Exit: 0 when every card it touched is down; 1 when one came back or could not be parked; 2 no board / bad
-      arguments; 3 unknown card id.
+Exit: 0 success (or dry-run report), 1 NOT DOWN, 2 no board/bad arguments, 3 unknown card id.
 """
 import argparse
 import json
@@ -188,8 +169,18 @@ def kill_run(run, card_id, dry):
     """Kill one run's worker process group. Returns (word, landed) for the report."""
     pid = int(run["worker_pid"])
     cmd = cmdline_of(pid)
-    if not is_our_worker(cmd, card_id):      # an empty / unreadable command line is refused too
+    if not is_our_worker(cmd, card_id):      # keep the existing cmdline/card guard
         return "refused pid %s (not this card's worker%s)" % (pid, "" if cmd else ": command line unreadable"), False
+    try:
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        recorded = run.get("worker_started_at")
+        current = _process_fingerprint(pid)
+        if not recorded or not current or recorded != current:
+            return "refused pid %s (native start fingerprint missing/unreadable/reused)" % pid, False
+        if os.name != "nt" and (os.getpgid(pid) != pid or os.getpgid(pid) == os.getpgrp()):
+            return "refused pid %s (not an isolated worker process group)" % pid, False
+    except Exception:  # identity-reader failure is refusal, never alternate kill authority
+        return "refused pid %s (native identity unknown)" % pid, False
     if dry:
         return "would kill run %s pid %s" % (run["id"], pid), True
     crew_proc.terminate_tree(pid, TERM_WAIT_S)
@@ -298,10 +289,12 @@ def park_card(card_id, dry):
         return "already parked", ""
     if status in ("running", "ready"):
         argv = ["block", card_id, "--kind", park_kind(card_id), reason]
+    elif status in ("review", "triage"):
+        argv = ["block", card_id, "--kind", "needs_input", reason]
     elif status in ("todo", "blocked"):
         argv = ["schedule", card_id, reason]
     elif status == "scheduled":
-        return "already parked", ""
+        return "foreign schedule (not an owner park)", ""
     else:
         return "cannot park a %s card" % status, ""
     if dry:
@@ -312,52 +305,93 @@ def park_card(card_id, dry):
 
 
 def stop_card(card, dry=False, archive=False):
-    """One card, in the order the docstring promises. Returns (report, ok, json facts)."""
+    """Capture native identities, fence/read back first, then guarded termination and settlement."""
     card_id = card["id"]
     before = snapshot(card_id)
-    runs = q("select id, status, worker_pid from task_runs where task_id = ?", (card_id,))
-    live = live_runs([dict(r) for r in runs], alive)
-    killed, kill_words = [], []
-    for r in live:
-        word, landed = kill_run(r, card_id, dry)
-        kill_words.append(word)
-        if landed:
-            killed.append(r)
-    closed, skipped = close_sessions(card_id, dry)
-    if archive:
-        _archived, archive_msg = archive_card(card_id, dry)
-        park_word = "archived"
+    sql = "select id, status, worker_pid, worker_started_at, claim_lock from task_runs where task_id = ?"
+    initial = q(sql, (card_id,))
+    captured = [r for r in initial if r["status"] == "running"]
+    initial_ids = {r["id"] for r in initial}
+    # A repeat stop must not forget a refused worker whose row the previous winning park closed.
+    park = crew_card.parked_by_owner(KANBAN_DB, card_id)
+    if park:
+        refs = q("select run_id from task_events where id = ?", (park,))
+        park_runs = {r["run_id"] for r in refs}
+        captured += [r for r in initial if r["id"] in park_runs and
+                     (r.get("worker_pid") or r.get("claim_lock"))]
+    park_word, message = park_card(card_id, dry)
+    held = snapshot(card_id) if not dry else before
+    parked = bool(not dry and held[0] in ("blocked", "scheduled") and
+                  crew_card.parked_by_owner(KANBAN_DB, card_id))
+    # Include the run closed by the winning park, including one claimed after the initial read.
+    after_park = q(sql, (card_id,)) if not dry else initial
+    captured_ids = {r["id"] for r in captured}
+    captured += [r for r in after_park if r["status"] == "running" or r["id"] in captured_ids or
+                 (r["id"] not in initial_ids and (r.get("worker_pid") or r.get("claim_lock")))]
+    relevant = { (r["id"], r.get("worker_pid"), r.get("worker_started_at"), r.get("claim_lock")): r
+                 for r in captured }
+    killed, kill_words, unsettled = [], [], []
+    for r in relevant.values():
+        pid = r.get("worker_pid")
+        if not pid:
+            unsettled.append(r["id"])
+            kill_words.append("run %s identity unknown (no native worker pid)" % r["id"])
+        elif not alive(pid):
+            continue                  # dead/zombie is settled without a signal
+        elif not parked and not dry:
+            unsettled.append(r["id"])
+            kill_words.append("run %s not signalled: native park not verified" % r["id"])
+        else:
+            word, landed = kill_run(r, card_id, dry)
+            kill_words.append(word)
+            if landed and not dry:
+                killed.append(r)
+            if not dry and (not landed or alive(pid)):
+                unsettled.append(r["id"])
+    # Native terminal status is NOT OS settlement. Recheck captured identities irrespective of status.
+    if not dry:
+        for r in relevant.values():
+            if (not r.get("worker_pid") or alive(r["worker_pid"])) and r["id"] not in unsettled:
+                unsettled.append(r["id"])
+        for r in q(sql, (card_id,)):
+            if r["status"] == "running" and r["id"] not in unsettled:
+                unsettled.append(r["id"])
+    worker_settled = not unsettled and not dry
+    if worker_settled and (parked or (archive and held[0] in CLOSED_STATUSES)):
+        closed, skipped = close_sessions(card_id, False)
     else:
-        park_word, archive_msg = park_card(card_id, dry)
+        closed = []
+        skipped = ["%s (worker settlement unconfirmed; session left open)" % sid
+                   for sid, _prof in sessions_of(card_id)]
+    if archive and worker_settled and (parked or held[0] in CLOSED_STATUSES):
+        _archived, message = archive_card(card_id, False)
+        park_word = "archive"
+    elif archive and dry:
+        park_word += "; would archive after settlement"
     after = snapshot(card_id) if not dry else before
-    # a killed worker that still answers (the guard refused it, or the signal did not land) is the
-    # one thing a stop may not report as done
-    still_live = live_runs([dict(r) for r in q("select id, status, worker_pid from task_runs "
-                                              "where task_id = ?", (card_id,))], alive) if not dry else []
+    parked = bool(not dry and after[0] in ("blocked", "scheduled") and
+                  crew_card.parked_by_owner(KANBAN_DB, card_id))
+    worker_settled = worker_settled and after[2] == 0
     links = q("select parent_id, child_id, ? as self from task_links where parent_id = ? or child_id = ?",
               (card_id, card_id, card_id))
-    cards = q("select id, status, assignee from tasks")
-    family = family_of([dict(l) for l in links], cards)
-    if dry:
-        ok = True
-    elif archive:
-        ok = after[0] == "archived" and not still_live
-    else:
-        ok = (after[0] == "scheduled" or (after[0] == "blocked" and bool(crew_card.parked_by_owner(KANBAN_DB, card_id)))) \
-            and not still_live
+    family = family_of(links, q("select id, status, assignee from tasks"))
+    ok = True if dry else worker_settled and (after[0] == "archived" if archive else parked)
     facts = {"card": card_id, "before": before, "after": after, "runs_killed": [r["id"] for r in killed],
-             "sessions_closed": closed, "sessions_skipped": skipped, "family": family, "still_down": ok, "parked": (not archive and ok), "how": park_word,
-             "kill_words": kill_words}
-    lines = report_lines(card, killed, closed, not dry, after, family)
-    if ok and not dry and not archive:
-        lines.append("  parked (%s): stays on the board with its history - /crew-unstuck %s to continue" % (park_word, card_id))
-    lines += ["  " + w for w in kill_words if "dead" not in w and "would kill" not in w]
+             "sessions_closed": closed, "sessions_skipped": skipped, "family": family, "still_down": ok,
+             "parked": parked, "worker_settled": worker_settled, "unsettled_runs": sorted(set(unsettled)),
+             "how": park_word, "kill_words": kill_words}
+    lines = report_lines(card, killed, closed, archive, after, family)
+    if relevant and not killed:
+        lines[1] = "  killed: none; see worker settlement below"
+    if parked:
+        lines.append("  parked (%s); worker_settled=%s - /crew-unstuck %s to continue" %
+                     (park_word, worker_settled, card_id))
+    lines += ["  " + w for w in kill_words]
     if skipped:
         lines.append("  session(s) not closed: " + ", ".join(skipped))
     if not ok:
-        lines.append("  %s said: %s" % ("archive" if archive else park_word, (archive_msg or "(nothing)")[-300:]))
-        lines.append("  NOT DOWN: status=%s still running=%s - the stop did not hold"
-                     % (after[0], [r["id"] for r in still_live]))
+        lines.append("  %s said: %s" % (park_word, (message or "(nothing)")[-300:]))
+        lines.append("  NOT DOWN: status=%s unsettled workers=%s" % (after[0], sorted(set(unsettled))))
     return lines, ok, facts
 
 

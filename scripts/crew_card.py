@@ -687,10 +687,25 @@ def parse_route(value):
     return "", "", ""
 
 
+def _budget_ceiling(body):
+    """One complete positive Budget field, plain digits or consistently grouped thousands."""
+    values = re.findall(r"(?mi)^[^\S\r\n]*Budget:[^\S\r\n]*([^\r\n]*)\r?$", body or "")
+    if len(values) != 1:
+        return None
+    match = re.fullmatch(r"([0-9]+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,3}(?:_[0-9]{3})+)"
+                         r"[^\S\r\n]*(?:tokens)?[^\S\r\n]*", values[0], re.I)
+    if not match:
+        return None
+    try:
+        ceiling = int(match[1].replace(",", "").replace("_", ""))
+    except ValueError:
+        return None
+    return ceiling if ceiling > 0 else None
+
+
 def parse_contract(body):
     """The contract a card body (or the intake's `kanban_create` body) states, as the dict
     `contract_gaps` and `render_body` work on. The inverse of render_body for every contract field."""
-    budget = re.search(r"\d[\d_,]*", field(body, "Budget") or "")
     units = [u.strip() for u in (field(body, "Units") or "").split("|") if u.strip()]
     if not units:  # the rendered form: a "Units (...):" header, then one "  - unit" line each
         inside = False
@@ -704,7 +719,7 @@ def parse_contract(body):
     route, model, provider = parse_route(field(body, "Route"))
     return {
         "role": (field(body, "Role") or "").strip().lower(),
-        "budget": int(re.sub(r"\D", "", budget.group(0))) if budget else None,
+        "budget": _budget_ceiling(body),
         "origin": field(body, "Origin") or "",
         "goal": field(body, "GOAL") or "",
         "artifact": field(body, "Artifact") or "",
@@ -2170,6 +2185,39 @@ def rewrite_line(body, label, value):
     return new if hits else (body or "").rstrip() + "\n" + line + "\n"
 
 
+def pending_owner_question(db, card_id):
+    """Only native unblocked after the latest ask releases supported-flow wait.
+
+    Not authentication of arbitrary native writers. Read errors do not grant work.
+    Do not use q_db: its compatibility error result is an empty list.
+    """
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+        try:
+            rows = conn.execute("select kind, payload from task_events where task_id = ? and kind in "
+                                "('crew_decision','unblocked') order by id", (card_id,)).fetchall()
+        finally:
+            conn.close()
+        waiting = False
+        for kind, payload in rows:
+            if kind == "unblocked":
+                waiting = False
+            else:
+                data = json.loads(payload or "{}")
+                if not isinstance(data, dict):
+                    return True
+                if data.get("decision") == "ask_owner":
+                    waiting = True
+        return waiting
+    except (sqlite3.Error, ValueError, TypeError):
+        return True
+
+
+def automatic_owner_hold(db, card_id):
+    """Existing wait/stop boundaries, without requiring a running worker identity."""
+    return pending_owner_question(db, card_id) or bool(parked_by_owner(db, card_id))
+
+
 def pending_proof_ask(card_id):
     """The proof question the owner has not answered, or None: the newest `ask_owner` decision that carries a
     `proof_ask` ({kind: "rescope", proposed} or {kind: "blocked", command, reason}), unless a `proof_confirm`
@@ -2218,7 +2266,13 @@ def owner_proof_answer(card_id, brave=False):
     row = card_row(card_id)
     if ask.get("kind") == "rescope" and row:
         _kanban(["edit", card_id, "--body", rewrite_line(row[4], "proof command", cmd)])
+    if row and row[2] == "triage":
+        ok, why = _park_pending_triage(card_id)
+        if not ok:
+            return "confirmed proof for %s; still held: %s" % (card_id, why)
     res = lift_block(card_id)
+    if res.get("rc") != 0 or res.get("status") in ("blocked", "triage", "scheduled"):
+        return "confirmed proof for %s; still held (%s): %s" % (card_id, res.get("status"), res.get("out"))
     return ("confirmed proof for %s: %s%s; card %s" % (card_id, cmd[:120], " (brave)" if brave else "",
                                                        res.get("status") or "not blocked"))
 
@@ -2385,6 +2439,17 @@ def hand_to_writer(card_id):
     return out
 
 
+def _park_pending_triage(card_id):
+    """Normalize a legacy question through native operator park, never specify/reopen."""
+    kb, conn = kb_conn()
+    try:
+        ok = kb.block_task(conn, card_id, reason="Needs you: pending owner question", kind="needs_input")
+        now = kb.get_task(conn, card_id)
+        return bool(ok and now and now.status == "blocked"), "native operator park refused"
+    finally:
+        conn.close()
+
+
 def unstuck_card(card_id):
     """The owner's way out when the coordinator has given up: (ok, text). A card in triage leaves it through the
     kernel's own exit with no field changed (it lands in todo, ready when no parent is open); a blocked card is
@@ -2395,13 +2460,58 @@ def unstuck_card(card_id):
         return False, "no such card: %s" % card_id
     if not is_crew_body(row[4]):
         return False, "%s is not a crew card" % card_id
+    if pending_proof_ask(card_id):
+        return False, "pending proof consent: answer /crew-proof %s yes|brave, not /crew-unstuck" % card_id
     parked = row[2] == "scheduled" and parked_by_owner(kanban_db(), card_id)
     if row[2] not in ("triage", "blocked") and not parked:
         return False, "%s is %s: nothing to unstick" % (card_id, row[2])
+    if row[2] == "triage" and pending_owner_question(kanban_db(), card_id):
+        ok, why = _park_pending_triage(card_id)
+        if not ok:
+            return False, "%s stays triage: %s" % (card_id, why)
     res = lift_block(card_id)
     if res["rc"] != 0:
         return False, "%s stays %s: %s" % (card_id, row[2], res["out"] or "the board refused")
     return True, "%s: %s -> %s" % (card_id, row[2], res["status"])
+
+
+def _recovery_budget(card_id, decision):
+    """Read-only internal recovery preflight: no new ceiling, coercion, floor or ledger reset."""
+    row = card_row(card_id)
+    if not row:
+        return None, "no such card: %s" % card_id
+    ceiling = _budget_ceiling(row[4])
+    if ceiling is None:
+        return None, "internal recovery needs a valid current Budget"
+    if "budget" in decision and (type(decision["budget"]) is not int or decision["budget"] != ceiling):
+        return None, "internal recovery must preserve Budget %d; use public Retry for a new budget" % ceiling
+    return ceiling, ""
+
+
+def _preserve_recovery(card_id, body, unblock=True):
+    """Compose the existing edit/lift path without touching Budget or active/.spent ledgers.
+
+    With no lift the card stays stopped until send_to_verifier performs its existing review handoff.
+    This is not an atomic edit+lift transaction (except the existing triage exit's body write).
+    """
+    ceiling, problem = _recovery_budget(card_id, {})
+    if problem:
+        return {"ok": False, "why": problem}
+    row = card_row(card_id)
+    if not row:
+        return {"ok": False, "why": "no such card: %s" % card_id}
+    res = {"ok": True, "budget": ceiling, "unblock": None}
+    if row[2] == "triage" and unblock:
+        res["unblock"] = lift_block(card_id, body=body)
+    else:
+        if body != (row[4] or ""):
+            r = _kanban(["edit", card_id, "--body", body])
+            if r.returncode != 0:
+                return {"ok": False, "why": "could not write the recovery into the card: %s"
+                                            % (r.stderr or r.stdout or "").strip()[-160:]}
+        if unblock:
+            res["unblock"] = lift_block(card_id)
+    return res
 
 
 def retry_card(card_id, budget=None, dry_run=False, unblock=True, profile=None, body=None):

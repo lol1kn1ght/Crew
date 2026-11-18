@@ -32,6 +32,10 @@ class SafetyCase(unittest.TestCase):
         self.home = tempfile.mkdtemp(prefix="crew-safety-test-").replace(os.sep, "/")
         self.db = os.path.join(self.home, "kanban.db")
         os.environ.update(HERMES_HOME=self.home, HERMES_KANBAN_DB=self.db)
+        # heal reads its CLI-pinned board; bind it to this same per-test database.
+        heal_db = mock.patch.object(crew_heal, "KANBAN_DB", self.db)
+        heal_db.start()
+        self.addCleanup(heal_db.stop)
         os.environ.pop("CREW_PROFILE_PREFIX", None)
         for k in ("HERMES_KANBAN_TASK", "CREW_COORDINATOR_TURN"):
             os.environ.pop(k, None)
@@ -58,7 +62,7 @@ class SafetyCase(unittest.TestCase):
         os.environ.update(self._env)
         shutil.rmtree(self.home, ignore_errors=True)
 
-    def card(self, cid="t_s", body="Role: worker\nCoordinator: c\nGOAL: g\nproof command: true\n", status="running"):
+    def card(self, cid="t_s", body="Role: worker\nCoordinator: c\nBudget: 1000 tokens\nGOAL: g\nproof command: true\n", status="running"):
         conn = sqlite3.connect(self.db)
         conn.execute("insert into tasks values (?, 't', ?, 'crew-worker', ?)", (cid, status, body))
         conn.commit()

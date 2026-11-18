@@ -55,7 +55,7 @@ class GuardCase(unittest.TestCase):
     def call(self, role, tool, args):
         plug, _where = self.plugin_for(role)
         os.environ["HERMES_KANBAN_TASK"] = "t_none"     # a spawned card run
-        with mock.patch.object(plug, "_card_budget", lambda card: None), \
+        with mock.patch.object(plug, "_card_budget", lambda card: 200000), \
                 mock.patch.object(plug, "_verdict_fails", lambda card: 0):
             return plug.crew_tool_guard(tool_name=tool, args=args, session_id="s", turn_id="t")
 
@@ -148,7 +148,7 @@ class ReviseScriptTests(unittest.TestCase):
         os.makedirs(os.path.dirname(self.script))
         self.write("import sys; sys.exit(0)\n")
         self.cmd = "%s %s" % (crew_card.PYTHON, self.script)   # crew_card.PYTHON: no python3 on Windows
-        self.body = ("Role: worker\nCoordinator: c\nVerify: independent\nGOAL: g\nproof command: %s\n" % self.cmd)
+        self.body = ("Role: worker\nCoordinator: c\nBudget: 200000 tokens\nVerify: independent\nGOAL: g\nproof command: %s\n" % self.cmd)
         conn = sqlite3.connect(self.db)
         conn.execute("insert into tasks values ('t_r', 't', 'blocked', 'crew-worker', ?)", (self.body,))
         conn.commit()
@@ -163,8 +163,8 @@ class ReviseScriptTests(unittest.TestCase):
         self.ctx = cc.Ctx(self.db, None, dry=False, say=lambda *_: None)
         for p in (mock.patch.object(crew_card, "_kanban", fake_kanban),
                   mock.patch.object(crew_card, "repin_for_review", lambda cid: {"action": "unchanged"}),
-                  mock.patch.object(crew_card, "retry_card",
-                                    lambda *a, **k: {"ok": True, "budget": 1, "unblock": {"rc": 0, "status": "ready"}}),
+                  mock.patch.object(crew_card, "_preserve_recovery",
+                                    lambda *a, **k: {"ok": True, "budget": 200000, "unblock": {"rc": 0, "status": "ready"}}),
                   mock.patch.object(crew_card, "lift_into_review",
                                     lambda cid, reviewer, summary: self.cli.append(["request-review", cid, "--reviewer",
                                                                                     reviewer]) or (True, reviewer)),
@@ -208,8 +208,8 @@ class ReviseScriptTests(unittest.TestCase):
 
     def test_the_card_names_the_verifier_in_its_proof_script_line_and_no_writer_path_is_left(self):
         dec = {"decision": "revise_script", "why": "stdlib only", "delegate": True}
-        with mock.patch.object(self.cc.crew_card, "retry_card") as retry:
-            retry.return_value = {"ok": True, "budget": 1, "unblock": {"rc": 0, "status": "ready"}}
+        with mock.patch.object(self.cc.crew_card, "_preserve_recovery") as retry:
+            retry.return_value = {"ok": True, "budget": 200000, "unblock": {"rc": 0, "status": "ready"}}
             self.cc.apply_decision(self.ctx, self.card, [], dec)
         self.assertIn("Proof script: verifier to revise - stdlib only", retry.call_args.kwargs["body"])
         self.assertFalse(retry.call_args.kwargs["unblock"])        # send_to_verifier lifts it, in the same step as the review

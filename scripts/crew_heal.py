@@ -131,6 +131,8 @@ def release_block(card):
     (promotion, parent re-gating, the `unblocked` event), called directly instead of through the command.
     Returns True when the card left `blocked`."""
     import crew_card
+    if crew_card.automatic_owner_hold(KANBAN_DB, card):
+        return False
     kb, conn = crew_card.kb_conn(KANBAN_DB)
     try:
         return bool(kb.unblock_task(conn, card))
@@ -160,6 +162,8 @@ def card_proof(card):
 
 def heal_dead_model(card, dry):
     import crew_card
+    if crew_card.automatic_owner_hold(KANBAN_DB, card["id"]):
+        return None
     if dry:
         return {"class": "dead_model", "card": card["id"], "action": "would re-pin via the router",
                 "fixed": True}
@@ -182,6 +186,8 @@ def heal_dead_model(card, dry):
 
 def heal_stale_verify(card, dry):
     import crew_card
+    if crew_card.automatic_owner_hold(KANBAN_DB, card["id"]):
+        return None
     cmd = card_proof(card)
     if not cmd:
         return None
@@ -202,6 +208,8 @@ def heal_stale_verify(card, dry):
                                         "verdict": "still failing", "ts": time.time()})
         return {"class": "stale_verify", "card": card["id"], "action": "proof still fails (rc=%d)" % rc,
                 "fixed": False}
+    if crew_card.automatic_owner_hold(KANBAN_DB, card["id"]):
+        return None             # an owner hold may have arrived while the proof ran
     lifted = crew_card.lift_block(card["id"])       # the kernel's unblock, plus the block counter reset
     p = type("Lift", (), {"returncode": lifted["rc"]})
     fell_back = False
@@ -244,7 +252,7 @@ def heal_card(card, dry=False):
     """
     status = card.get("status")
     import crew_card
-    if crew_card.parked_by_owner(KANBAN_DB, card.get("id")):
+    if crew_card.automatic_owner_hold(KANBAN_DB, card.get("id")):
         return None             # /crew-stop parked it: it stays down until the owner continues it
     if status == "ready":
         err = card.get("last_failure_error") or ""

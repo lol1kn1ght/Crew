@@ -41,6 +41,7 @@ under `crew.source_dir`, which the scripts use to find the package when an insta
 import importlib.util
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -569,7 +570,6 @@ def _profile_name():
 # (HERMES_KANBAN_TASK set), so the owner's own chat profile is never affected.
 
 _ROLE = None
-_BUDGET_CACHE = {}
 ALWAYS_ALLOWED_OVER_BUDGET = {"kanban_block", "kanban_comment", "kanban_show", "kanban_heartbeat"}
 # Allowed over budget only when the card passes the close rule (a PASS line for its proof command).
 CLOSE_TOOLS_AFTER_PASS = {"kanban_complete", "kanban_request_review", "kanban_block"}
@@ -702,18 +702,31 @@ def _budget_file(card):
 
 
 def _card_budget(card):
-    if card not in _BUDGET_CACHE:
-        m = re.search(r"^\s*Budget:\s*([0-9]+)", _card_body(card), re.M | re.I)
-        _BUDGET_CACHE[card] = int(m.group(1)) if m else None
-    return _BUDGET_CACHE[card]
+    tool = _card_tool()
+    return tool._budget_ceiling(_card_body(card)) if tool is not None else None
+
+
+def _budget_data(card):
+    """Active local ledger, or None for existing unknown accounting. Absence keeps legacy zero."""
+    path = _budget_file(card)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None if os.path.lexists(path) else {"used": 0}
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    used = data.get("used")
+    if type(used) not in (int, float) or used < 0 or (isinstance(used, float) and not math.isfinite(used)):
+        return None
+    return data
 
 
 def _budget_used(card):
-    try:
-        with open(_budget_file(card), encoding="utf-8") as fh:
-            return int(json.load(fh).get("used", 0))
-    except Exception:
-        return 0
+    data = _budget_data(card)
+    return int(data["used"]) if data is not None else None
 
 
 CACHE_READ_WEIGHT = 0.1     # a cache read bills at a tenth of the input rate (Anthropic)
@@ -761,14 +774,10 @@ def crew_budget_account(usage=None, **kwargs):
         raw = 0
     try:
         path = _budget_file(card)
+        prev = _budget_data(card)
+        if prev is None:
+            return None  # preserve existing damaged evidence; it is not a fresh zero bucket
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        try:
-            with open(path, encoding="utf-8") as fh:
-                prev = json.load(fh)
-            if not isinstance(prev, dict):
-                prev = {}
-        except Exception:
-            prev = {}
 
         def _int(key):
             try:
@@ -886,12 +895,10 @@ def _note_overrun(card, used, budget, tool_name):
     """Record a budget overrun on a PASS card as a warning in the card's budget file."""
     try:
         path = _budget_file(card)
+        data = _budget_data(card)
+        if data is None:
+            return
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        try:
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
-            data = {"card": card, "used": used, "budget": budget}
         data["overrun_warning"] = {"used": used, "budget": budget, "tool": tool_name, "ts": time.time()}
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -1335,9 +1342,27 @@ def crew_tool_guard(tool_name=None, args=None, **kwargs):
     blocked = _thrash_guard(card, tool_name)
     if blocked:
         return blocked
-    budget = _card_budget(card)
-    used = _budget_used(card)
-    if budget and tool_name not in ALWAYS_ALLOWED_OVER_BUDGET and used >= budget:
+    try:
+        budget = _card_budget(card)
+        used = _budget_used(card)
+    except Exception:  # a raised hook error would otherwise let the call through
+        budget = used = None
+    if tool_name not in ALWAYS_ALLOWED_OVER_BUDGET and (budget is None or budget <= 0 or used is None):
+        # Closing an already-proved card does not authorize new work or repair unknown accounting.
+        if tool_name in CLOSE_TOOLS_AFTER_PASS:
+            try:
+                tool = _card_tool()
+                body = _card_body(card)
+                if tool is not None and tool.needs_pass(body) and tool.close_check(card, body, tool.claimed_at(card))[0]:
+                    return None
+            except Exception:
+                pass  # retain the explicit unknown refusal, never raise into the host hook
+        return {"action": "block",
+                "message": _stop_message(
+                    "crew budget unknown for card %s: a valid positive Budget and readable local used ledger "
+                    "are required. Hard stop." % card,
+                    "needs_input", "Needs you: budget unknown")}
+    if budget and used is not None and tool_name not in ALWAYS_ALLOWED_OVER_BUDGET and used >= budget:
         # A card the verifier already proved must still be closable: blocking the close only forces
         # a second run to finish work that passed. The overrun becomes a warning in the summary.
         if tool_name in CLOSE_TOOLS_AFTER_PASS and _close_ok(card)[0]:

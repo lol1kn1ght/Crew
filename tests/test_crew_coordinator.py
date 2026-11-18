@@ -283,7 +283,7 @@ class HandleCardTests(unittest.TestCase):
         add_event("t_1", "block_loop_detected")
         add_event("t_1", "crew_decision", {"decision": "ask_owner", "question": "q?", "for_event": 1})
         self.assertIn("waiting for the owner", self.handle()["detail"])
-        add_event("t_1", "specified")               # /crew-unstuck: the kernel's own triage exit
+        add_event("t_1", "unblocked")               # /crew-unstuck now normalizes legacy triage then unblocks
         add_event("t_1", "block_loop_detected")     # stuck again: the coordinator must look at it, not stay silent
         self.assertEqual("retry", self.handle()["action"])
 
@@ -783,14 +783,14 @@ class ApplyDecisionTests(unittest.TestCase):
 
     def test_a_retry_of_a_triage_card_hands_the_rewritten_body_to_the_one_kernel_exit(self):
         card = self.card(status="triage")
-        dec = {"decision": "retry", "fix": "use the other endpoint", "budget": 10 ** 12}
+        dec = {"decision": "retry", "fix": "use the other endpoint", "budget": 200000}
         res = {"ok": True, "budget": 1, "unblock": {"rc": 0, "status": "ready"}}
-        with mock.patch.object(cc.crew_card, "retry_card", return_value=res) as retry:
+        with mock.patch.object(cc.crew_card, "_preserve_recovery", return_value=res) as retry:
             ok, out = cc.apply_decision(self.ctx, card, [], dec)
         self.assertTrue(ok, out)
         kw = retry.call_args.kwargs
         self.assertIn("Coordinator fix 1: use the other endpoint", kw["body"])
-        self.assertEqual(cc.clamp_budget(10 ** 12), kw["budget"])
+        self.assertNotIn("budget", kw, "internal recovery has no resetting budget argument")
         self.assertNotIn("edit", [c[0] for c in self.cli], "no separate edit: the exit writes the body")
         self.assertIn("fix 1 written", out)
 
@@ -838,6 +838,15 @@ class ApplyDecisionTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_ask_owner_types_an_untyped_block_and_a_held_ready_card_but_not_a_typed_block(self):
+        original = cc.kanban
+        def landed(*args, **kw):
+            result = original(*args, **kw)
+            if args[0] == "block":
+                sql("update tasks set status='blocked', block_kind='needs_input' where id=?", (args[1],))
+            return result
+        bound = mock.patch.object(cc, "kanban", landed)
+        bound.start()
+        self.addCleanup(bound.stop)
         for cid, status, kind, blocks in (("t_u", "blocked", None, True), ("t_r", "ready", None, True),
                                           ("t_t", "blocked", "transient", False)):
             self.cli.clear()
@@ -877,7 +886,7 @@ class ApplyDecisionTests(unittest.TestCase):
 
     def test_the_contract_rewrite_never_writes_a_proof_line(self):
         card = self.card()
-        with mock.patch.object(cc.crew_card, "retry_card", return_value={"ok": True, "budget": 1}) as retry:
+        with mock.patch.object(cc.crew_card, "_preserve_recovery", return_value={"ok": True, "budget": 1}) as retry:
             ok, _ = cc.apply_retry(self.ctx, card, {"decision": "rescope", "proof_cmd": "touch x", "fix": "f"}, [],
                                    with_contract=True)
         body = retry.call_args.kwargs["body"]                    # a blocked card is rewritten in one retry write
@@ -960,7 +969,7 @@ class RecoveryDirectiveTests(unittest.TestCase):
             return {"ok": True, "budget": 1, "unblock": {"rc": 0, "status": "ready"}}
 
         for patch in (mock.patch.dict(os.environ, {"HERMES_KANBAN_DB": _DB}),
-                      mock.patch.object(cc.crew_card, "retry_card", side_effect=retry),
+                      mock.patch.object(cc.crew_card, "_preserve_recovery", side_effect=retry),
                       mock.patch.object(cc.crew_card, "hand_to_writer",
                                         return_value={"reopened": False, "assigned": ""})):
             patch.start()
@@ -1253,7 +1262,7 @@ class RecoveryRoutingTests(unittest.TestCase):
         self.answers({"decision": "revise_script", "why": "repair anchored Steps parser; keep command and criteria",
                       "delegate": True, "failure_kind": "proof_script"})
         with mock.patch.object(cc, "run_verdict", side_effect=AssertionError("coordinator ran proof")), \
-                mock.patch.object(cc.crew_card, "retry_card",
+                mock.patch.object(cc.crew_card, "_preserve_recovery",
                                   return_value={"ok": True, "budget": 1}) as retry, \
                 mock.patch.object(cc.crew_card, "hand_to_writer") as writer, \
                 mock.patch.object(cc.crew_card, "repin_for_review", return_value={"action": "unchanged"}), \
@@ -1278,7 +1287,7 @@ class RecoveryRoutingTests(unittest.TestCase):
         self.verifier_block("Fabricated citations; also says 'only verifier repairs proof'")
         self.answers({"decision": "retry", "fix": "replace fabricated citations", "failure_kind": "artifact"})
         with mock.patch.object(cc.crew_card, "authorize_script_revision") as authorize, \
-                mock.patch.object(cc.crew_card, "retry_card", return_value={"ok": True, "budget": 1}) as retry, \
+                mock.patch.object(cc.crew_card, "_preserve_recovery", return_value={"ok": True, "budget": 1}) as retry, \
                 mock.patch.object(cc.crew_card, "hand_to_writer",
                                   return_value={"reopened": True, "assigned": ""}) as writer:
             dec, _, _ = cc.resolve(self.ctx, self.card, [], {"id": 1})
@@ -1290,7 +1299,7 @@ class RecoveryRoutingTests(unittest.TestCase):
     def test_historical_retry_prose_alone_neither_authorizes_nor_changes_retry_semantics(self):
         dec = {"decision": "retry", "fix": "Only verifier repairs proof; writer must not edit verify.py"}
         with mock.patch.object(cc.crew_card, "authorize_script_revision") as authorize, \
-                mock.patch.object(cc.crew_card, "retry_card", return_value={"ok": True, "budget": 1}), \
+                mock.patch.object(cc.crew_card, "_preserve_recovery", return_value={"ok": True, "budget": 1}), \
                 mock.patch.object(cc.crew_card, "hand_to_writer",
                                   return_value={"reopened": True, "assigned": ""}) as writer:
             self.assertTrue(cc.apply_decision(self.ctx, self.card, [], dec)[0])

@@ -157,6 +157,14 @@ class HealCardRoutingTests(unittest.TestCase):
 
     def setUp(self):
         self.seen = []
+        # Routing tests still stand in for remedies; bind the new read-only question lookup
+        # to a real empty synthetic native board, not a nonexistent database/read error.
+        directory = tempfile.mkdtemp(dir=_TMPDIR)
+        _kb, conn, db = K.open_board(directory)
+        self.addCleanup(conn.close)
+        bound = mock.patch.object(crew_heal, "KANBAN_DB", db)
+        bound.start()
+        self.addCleanup(bound.stop)
 
         def remedy(name, fixed=True):
             def fn(card, dry):

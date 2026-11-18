@@ -87,26 +87,41 @@ that the plugin loads and registers; it reports nothing about roles, crons or pr
 - `/crew-graph <card id|latest> [--watch N | --html [NAME]]`  one card's flow graph (layered box
                            nodes); `--watch N` renders two frames N seconds apart, `--html [NAME]` writes
                            the self-contained HTML (a bare file name, under the profile's `cache/scratch/`) plus its JSON and prints the absolute paths
-- `/crew-stop [<card id>] [--archive] [--dry-run]`  PARK one card, or every open crew card, without destroying
-                           work: kill each live run's worker process (never a pid whose command line it cannot
-                           read), close the session it left open (Hermes's SessionDB), then hold the card with
-                           the reason "stopped by owner (/crew-stop) - continue with /crew-unstuck <id>":
-                           `hermes kanban block` (running/ready; Needs-you lane) or `hermes kanban schedule`
-                           (parent-gated todo, already blocked). The coordinator, heal and notify leave a parked
-                           card alone; the in-session watcher says "stopped by you" once. `--archive <id>` is the
-                           explicit drop (`hermes kanban archive`); a bare `stop` only ever parks, never other
-                           cards' work; `--dry-run` only reports. triage and review cards have no park verb in
-                           the kernel and are reported NOT down. Open cards linked to the stopped one are named,
-                           never followed silently
-- `/crew-unstuck <card id>`  a card the coordinator gave up on goes back in the queue: out of triage with
-                           no change (the kernel's `specify_triage_task`), or `hermes kanban unblock` (also how a parked card continues, with its whole history)
+- `/crew-stop [<card id>] [--archive] [--dry-run]` PARK one card, or every open Crew card. Capture relevant
+                           native runs first; park/fence and read back the owner marker BEFORE signalling.
+                           Running/ready use typed `block`; runless review/triage use operator needs_input
+                           `block`; todo/blocked use phase-preserving `schedule`. A foreign schedule is not
+                           an owner park. Only the exact cmdline/card-guarded worker with a matching native
+                           start fingerprint can be terminated (POSIX: its isolated group, never caller's).
+                           Recheck originally captured and winning-park-terminalized runs, not just running
+                           DB rows. Unknown, unreadable or reused PID identity is NOT DOWN, never another
+                           kill method. `parked=true` is independent of `worker_settled`; sessions remain
+                           open until all relevant workers settle. `--archive` is an explicit separate drop
+                           after park and settlement (or already-terminal state); `--dry-run` changes nothing. Repeat own park is
+                           idempotent; open family is reported, never stopped recursively. Coordinator,
+                           heal and notify leave owner parks alone. This is not universal all-writer
+                           fencing/quiescence or an atomic process-identity lease.
+- `/crew-unstuck <card id>` continues a general owner wait or owner stop with native `unblock`, preserving
+                           history, budget ledgers, reviewer phase and parent gates. Legacy pending triage
+                           is first operator-parked, never specified/reopened through a runnable window.
+                           Ordinary triage without a pending question retains its existing specify exit.
+                           This command refuses pending proof consent: use `/crew-proof` instead.
 - `/crew-safety [brave|safe]`  no argument shows the proof safety mode; `brave` sets `approvals.mode: off`
                            in the crew role profiles, `safe` restores what each had before
 - `/crew-proof <card id> <yes|brave>`  the owner's answer to a proof question: `yes` accepts the proof command
                            the coordinator proposed, `brave` runs a proof Hermes flagged as dangerous. It is the
                            only route that records consent - the snapshot trusts a `proof_confirm` event with
                            `by=owner`, and only this command writes one, so a card's own run can never answer
-                           its own proof question (the old `proof-answer` CLI is gone)
+                           its own proof question (the old `proof-answer` CLI is gone). Confirmation is
+                           reported separately from release: a refused native lift leaves the card held.
+
+`ask_owner` first checks a native non-runnable hold, then comments. Existing typed sticky blocks are
+retained. Automatic completion, heal (including direct/fallback release), audit and each decider call
+respect a pending owner question or owner stop without requiring a running-worker identity. Only native
+`unblocked` after the latest question clears the general wait; specified/claimed/spawned/completed,
+comments, self_heal and quota hold_released do not. Read errors grant no automatic work. This recognizes
+the supported continuation flow, NOT a cryptographic/trusted-human receipt from arbitrary native writers.
+No resource grant, new human step per phase, ledger reset or card-wide resource admission is introduced.
 - `/crew-diagnose [state]`  the read-only pass (a skill, so it runs in this session's own turn): every
                            card sitting in that state (`blocked` when none is named) with its id, kind,
                            wait and reason, then how each would resume and who takes that step. It
@@ -217,6 +232,26 @@ The field is optional for compatibility with older callers, but supplied values 
 An explicit unknown cause must not authorize writer repair. `delegate`, when supplied, is a JSON boolean,
 not a truthy string. Free-form worker text is evidence to assess, never script-revision authority;
 these checks do not automatically detect an omitted or incorrect model classification.
+
+Internal `retry`, same-proof `rescope` and `revise_script` continue the existing resource allowance:
+no `budget` field preserves the current valid `Budget`, and an integer equal to that ceiling is a no-op.
+A different or invalid value is refused before body, route, script-hash, revision-authorization or lift
+changes. Active budget ledgers and retained `.spent` files are left byte-for-byte unchanged. Public
+Retry (CLI/Desktop) still rewrites the ceiling and rotates active ledgers to reset their counters.
+This does not provide an aggregate writer/verifier allowance, coordinator-call accounting or an atomic
+edit/lift/handoff transaction.
+
+The bound role's tool guard rereads one complete positive `Budget:` field on each call; plain digits
+and consistently comma/underscore-grouped thousands are supported, with an optional `tokens` suffix.
+Missing, malformed, nonpositive or duplicate fields are unknown, not an unlimited allowance. The same
+reader serves contract parsing and internal recovery. Active usage remains profile-local weighted tokens
+(cache read 0.1, cache write 1.25); this is neither a card-wide sum nor a pre-model financial cap.
+An existing unreadable/damaged/non-object ledger or missing/invalid `used` is unknown and is not replaced
+by the observer. Numeric finite nonnegative `used` retains the old integer arithmetic; other metadata
+is optional. Emergency block/show/comment/heartbeat and closing after an existing valid PASS remain
+available, but a new `crew_verdict` is not a close exemption. Closing never repairs unknown ledger bytes.
+An absent ledger still means zero for compatibility, and the first response can create it: fresh use
+versus lost/deleted history remains unresolved. No lost-write, crash or concurrency guarantee is added.
 
 The retry allowance resets after `ask_owner`; persistent directive numbering does not. Existing fix and
 constraint lines are retained, generated directive identities are recorded with coordinator decisions,

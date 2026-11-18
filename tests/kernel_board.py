@@ -77,6 +77,12 @@ def kernel_cli(path):
                 ok = kb.schedule_task(conn, cid, reason=" ".join(rest[2:]))
             elif verb == "archive":
                 ok = kb.archive_task(conn, cid)
+            elif verb == "comment":
+                ok = kb.add_comment(conn, cid, author="synthetic", body=" ".join(rest[2:]))
+            elif verb == "log":
+                content = kb.read_worker_log(cid, tail_bytes=int(rest[rest.index("--tail") + 1]))
+                return SimpleNamespace(returncode=0 if content is not None else 1,
+                                       stdout=content or "", stderr="" if content is not None else "no log")
             else:
                 raise AssertionError("kernel_cli has no stand-in for %r" % verb)
         return SimpleNamespace(returncode=0 if ok else 1, stdout="ok" if ok else "", stderr="" if ok else "refused")

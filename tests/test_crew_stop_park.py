@@ -89,7 +89,11 @@ class ParkTests(unittest.TestCase):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         self.procs.append(proc)
         time.sleep(0.3)
-        self.conn.execute("update task_runs set worker_pid = ? where task_id = ?", (proc.pid, cid))
+        from hermes_cli.kanban_db_dispatch import _process_fingerprint
+        fingerprint = _process_fingerprint(proc.pid)
+        self.assertIsNotNone(fingerprint)
+        self.conn.execute("update task_runs set worker_pid = ?, worker_started_at = ? where task_id = ?",
+                          (proc.pid, fingerprint, cid))
         import json
         self.conn.execute("insert into task_events (task_id, run_id, kind, payload, created_at) values (?,?,?,?,?)",
                           (cid, None, "session", json.dumps({"session": SESSION, "profile": "crew-worker"}),
@@ -195,12 +199,13 @@ class ParkTests(unittest.TestCase):
         self.assertEqual(0, rc, out)
         self.assertEqual(before, K.events(self.conn, cid))
 
-    def test_a_triage_card_cannot_be_parked_and_says_so(self):
+    def test_a_runless_triage_card_is_operator_parked_without_specify(self):
         cid = K.add_card(self.conn, "triage")
         rc, out = self.stop(cid)
-        self.assertEqual(1, rc)
-        self.assertIn("NOT DOWN", out)
-        self.assertEqual("triage", self.status(cid))
+        self.assertEqual(0, rc, out)
+        self.assertEqual("blocked", self.status(cid))
+        self.assertTrue(crew_card.parked_by_owner(self.db, cid))
+        self.assertNotIn("specified", K.events(self.conn, cid))
 
     # -------------------------------------------------------------------------------- archive / bare
     def test_archive_flag_archives_and_kills(self):

@@ -207,16 +207,8 @@ def decisions_of(ctx, card_id):
 
 
 def awaiting_owner(ctx, card_id, decisions):
-    """The last decision asked the owner and nothing has moved the card since (no unblock, no new run, no exit
-    from triage: the kernel's `specified` event is what /crew-unstuck and a coordinator rewrite leave)."""
-    asked = [d for d in decisions if d.get("decision") == "ask_owner"]
-    if not asked:
-        return False
-    since = asked[-1]["_id"]
-    moved = q(ctx, "select 1 from task_events where task_id = ? and id > ? and kind in "
-                   "('unblocked', 'specified', 'claimed', 'spawned', 'completed', 'promoted_manual') limit 1",
-              (card_id, since))
-    return not moved
+    """Only supported native continuation clears a question, not automatic movement."""
+    return crew_card.pending_owner_question(ctx.db, card_id)
 
 
 def stopped_after(ctx, card_id, event_id):
@@ -440,6 +432,8 @@ def ask_model(ctx, card, decisions, extra=""):
             fh.write(facts + (("\n\n## Refused\nYour previous answer was refused: %s. Answer again."
                                % problem) if problem else ""))
         try:
+            if crew_card.automatic_owner_hold(ctx.db, card["id"]):
+                return None, "waiting for the owner / stopped by the owner"
             out, rc = ctx.decider(ctx, path)
         finally:
             os.unlink(path)
@@ -531,9 +525,12 @@ def clamp_budget(value):
 
 
 def apply_retry(ctx, card, dec, decisions, with_contract=False, lift=True):
-    """`lift=False`: a stopped card is written (fix, budget, ledger) but stays stopped: the caller moves it on in one
+    """`lift=False`: a stopped card is written (fix only, preserving budget/ledgers) but stays stopped: the caller moves it on in one
     step of its own (revise_script delegate: crew_card.send_to_verifier lifts and requests review together)."""
     cid, body = card["id"], card.get("body") or ""
+    _ceiling, problem = crew_card._recovery_budget(cid, dec)
+    if problem:
+        return False, problem
     # The retry cap resets at ask_owner; directive identities must not reset with it.
     previous_numbers = [d["fix_number"] for d in decisions if d.get("decision") in FIX_DECISIONS
                         and type(d.get("fix_number")) is int and d["fix_number"] > 0]
@@ -563,7 +560,7 @@ def apply_retry(ctx, card, dec, decisions, with_contract=False, lift=True):
     if card["status"] in ("blocked", "triage"):
         # one write of the rewritten card: a triaged card leaves triage through the kernel's own exit
         # (`specify_triage_task` with the new approach), a blocked one is edited and then unblocked
-        res = crew_card.retry_card(cid, budget=clamp_budget(dec.get("budget")), profile=None, body=body, unblock=lift)
+        res = crew_card._preserve_recovery(cid, body=body, unblock=lift)
         if not res.get("ok") or (res.get("unblock") or {}).get("rc") not in (0, None):
             return False, "retry did not lift the card: %s" % json.dumps(res.get("unblock") or res)[:160]
         if body != (card.get("body") or ""):
@@ -684,9 +681,21 @@ def blocked_ask_for(card, out=""):
 def apply_ask_owner(ctx, card, question, detail=""):
     cid = card["id"]
     text = "Needs you: %s" % " ".join(question.split())[:2000]
-    if card["status"] == "ready" or (card["status"] == "blocked" and not card.get("block_kind")):
-        # a held ready card is stopped for the owner; an untyped breaker block is typed in place
-        kanban("block", cid, "--kind", "needs_input", text)
+    # Read actual state, not the pre-decision snapshot. Retain existing typed sticky blocks.
+    current = get_card(ctx, cid) or {}
+    if current.get("status") in ("ready", "running", "review", "triage") or (
+            current.get("status") == "blocked" and not current.get("block_kind")):
+        rc, out = kanban("block", cid, "--kind", "needs_input", text)
+        current = get_card(ctx, cid) or {}
+        if rc == 0 and current.get("status") == "triage":
+            # Same-kind recurrence escalated: use native runless operator park, never specify.
+            rc, out = kanban("block", cid, "--kind", "needs_input", text)
+            current = get_card(ctx, cid) or {}
+        if rc != 0:
+            return False, "owner hold pending: %s" % out[-160:]
+    if not ((current.get("status") == "blocked" and current.get("block_kind") in
+             ("needs_input", "capability", "transient")) or crew_card.parked_by_owner(ctx.db, cid)):
+        return False, "owner hold pending: native state %s is not a checked sticky hold" % current.get("status")
     rc, out = kanban("comment", cid, text + ("\n\n" + detail if detail else ""))
     return rc == 0, text if rc == 0 else "comment failed: %s" % out[-160:]
 
@@ -808,6 +817,9 @@ def resolve_script(ctx, card, decisions, reason):
                                                      "what to do (%s). What should happen to this card?"
                                                      % (problem or reason)[:160]}, "verify", False
     if again["decision"] == "revise_script" and again.get("delegate", False) is False:
+        _ceiling, problem = crew_card._recovery_budget(card["id"], again)
+        if problem:
+            return {"decision": "ask_owner", "question": problem}, "verify", False
         accept_script(card, again["why"])
         rc, out = run_verdict(card["id"])
         if rc == 0:
@@ -825,6 +837,9 @@ def apply_revise_script(ctx, card, dec, decisions):
     verifier's review step (crew_card.send_to_verifier); the verifier's next run records the new hash with this
     reason. Without delegate the script is accepted as it is now and the card runs again as a retry."""
     problem = check_decision(dec)
+    if problem:
+        return False, problem
+    _ceiling, problem = crew_card._recovery_budget(card["id"], dec)
     if problem:
         return False, problem
     why = " ".join(str(dec.get("why") or "").split())[:300]
@@ -856,6 +871,10 @@ def apply_decision(ctx, card, decisions, dec):
     problem = check_decision(dec)
     if problem:
         return False, problem
+    if dec["decision"] in ("retry", "rescope", "revise_script"):
+        _ceiling, problem = crew_card._recovery_budget(card["id"], dec)
+        if problem:
+            return False, problem
     dec.pop("fix_number", None)                  # generated by apply_retry, never chosen by the model
     kind = dec["decision"]
     if kind == "revise_script":
@@ -929,6 +948,8 @@ def audit_proof(ctx, card, event):
     holds. A FAIL comments the output on the done card and opens one follow-up card under it (a chain of
     MAX_AUDIT_FOLLOWUPS at most, then the owner is asked). Plan machinery (the coordinator's own cards) is not audited.
     Every outcome is an `audit` crew_decision carrying the event id, which is what makes the audit run once."""
+    if crew_card.automatic_owner_hold(ctx.db, card["id"]):
+        return {"detail": "waiting for the owner / stopped by the owner"}
     body = card.get("body") or ""
     if (crew_card.field(body, "Role") or "").strip().lower() not in crew_card.WRITER_ROLES:
         return {"detail": "completed: no proof to audit"}
@@ -944,6 +965,8 @@ def audit_proof(ctx, card, event):
         dec = {"decision": "audit", "outcome": "pass", "why": "closed on the coordinator's own PASS run"}
         record_decision(ctx, card, event, dec, dec["why"], True)
         return {"action": "audit pass", "detail": dec["why"]}
+    if crew_card.automatic_owner_hold(ctx.db, card["id"]):
+        return {"detail": "waiting for the owner / stopped by the owner"}
     rc, out = run_verdict(card["id"], for_event=event["id"])
     first = next((ln for ln in out.splitlines() if ln.strip()), "")
     if rc == crew_card.PROOF_BLOCKED and crew_safety.is_script_block(script_reason(card)):
@@ -1001,6 +1024,8 @@ def audit_completion(ctx, card, event):
     (`hermes kanban complete --force`, which no tool guard sees) and is recorded as an `owner_close` decision.
     The loop never reopens or re-decides such a card: the owner's word stands. A completion that does pass is
     audited once by re-running the proof (audit_proof)."""
+    if crew_card.automatic_owner_hold(ctx.db, card["id"]):
+        return {"detail": "waiting for the owner / stopped by the owner"}
     if card["status"] != "done" or not crew_card.needs_pass(card.get("body")):
         return {"detail": "completed: no proof to audit"}
     if any(d.get("decision") in ("owner_close", "audit") and d.get("for_event") == event["id"]
@@ -1028,6 +1053,9 @@ def handle_card(ctx, card_id, events):
         return out
     if crew_card.probe_card(card.get("created_by")) and not ctx.probe:
         out["detail"] = "probe fixture"
+        return out
+    if crew_card.automatic_owner_hold(ctx.db, card_id):
+        out["detail"] = "waiting for the owner's answer / stopped by the owner (/crew-stop)"
         return out
     completions = [e for e in events if e["kind"] == "completed"]
     events = [e for e in events if e["kind"] != "completed"]    # a completion is audited, it never asks for a decision
